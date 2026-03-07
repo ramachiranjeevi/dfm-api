@@ -54,8 +54,19 @@ async def login_check(body: LoginRequest, db: AsyncSession = Depends(get_db)):
         )
         return LoginResponse(status="success", value=[detail])
 
+    # PIN is set but not provided — tell app to prompt for PIN
+    if not body.Pin:
+        detail = LoginCheckDetail(
+            userId=user_rec.UCode,
+            RoleCode=user_rec.RoleCode,
+            userName=user_rec.UserName,
+            otp=login_rec.OTP,
+            isOtpVerified=True,
+        )
+        return LoginResponse(status="success", value=[detail])
+
     # PIN provided — validate it
-    if not body.Pin or body.Pin != login_rec.Pin:
+    if body.Pin != login_rec.Pin:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid PIN")
 
     token = create_access_token({"sub": user_rec.UCode, "role": user_rec.RoleCode})

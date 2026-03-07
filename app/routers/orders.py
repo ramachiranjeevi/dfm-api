@@ -172,7 +172,8 @@ async def get_orders(body: GetOrdersRequest, db: AsyncSession = Depends(get_db))
             & (AgricultureEquipment.SubEquipmentID == Orders.SubEquipmentId),
         )
         .where(
-            Orders.UserId == body.UserID,
+            *([Orders.UserId == body.UserID] if body.UserID else []),
+            *([Orders.OwnerId == body.OwnerId] if body.OwnerId else []),
             Orders.IsDeleted == False,
             OrderStatus.StatusID.in_([STATUS_CREATED, STATUS_ACCEPTED]),
         )
@@ -232,7 +233,8 @@ async def get_completed_orders(body: GetOrdersRequest, db: AsyncSession = Depend
             & (AgricultureEquipment.SubEquipmentID == Orders.SubEquipmentId),
         )
         .where(
-            Orders.UserId == body.UserID,
+            *([Orders.UserId == body.UserID] if body.UserID else []),
+            *([Orders.OwnerId == body.OwnerId] if body.OwnerId else []),
             Orders.IsDeleted == False,
             OrderStatus.StatusID == STATUS_COMPLETED,
         )

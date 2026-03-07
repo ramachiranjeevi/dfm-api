@@ -50,7 +50,8 @@ class DeleteOrderRequest(BaseModel):
 
 class GetOrdersRequest(BaseModel):
     OrderID: str | None = None
-    UserID: str
+    UserID: str | None = None   # Filter by customer UserId; None = all orders (admin)
+    OwnerId: str | None = None  # Filter by OwnerId (for owner portal)
 
 
 class OrderProcessingRequest(BaseModel):
