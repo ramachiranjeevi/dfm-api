@@ -1,12 +1,12 @@
-#!/usr/bin/env bash
-# Render build script — runs once during every deployment
+#\!/usr/bin/env bash
+# Render build script
 
-set -e  # Exit immediately on any error
+set -e
 
-echo "📦 Installing Python dependencies..."
+echo "Installing Python dependencies..."
 pip install -r requirements.txt
 
-echo "🗄️  Running database migrations..."
+echo "Running database migrations..."
 alembic upgrade head
 
-echo "✅ Build complete!"
+echo "Build complete\!"
