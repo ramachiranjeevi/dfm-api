@@ -44,7 +44,7 @@ services:
 # ── PostgreSQL Database ─────────────────────────────────────────────────────────
 databases:
   - name: dfm-db
-    databaseName: DigitalFarming
+    databaseName: digitalfarming
     user: dfm_user
     region: singapore              # must match the web service region above
     plan: free                     # 1GB storage, free for 90 days then $7/mo
