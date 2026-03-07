@@ -1,0 +1,50 @@
+## render.yaml — Infrastructure as Code for Render.com
+## Commit this file and Render will auto-configure your services.
+
+services:
+  # ── FastAPI Web Service ──────────────────────────────────────────────────────
+  - type: web
+    name: dfm-api
+    runtime: python
+    region: singapore          # closest to India — change to: oregon / frankfurt / ohio
+    plan: free                 # change to "starter" ($7/mo) for always-on
+    buildCommand: "./build.sh"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+
+    envVars:
+      # Render auto-injects DATABASE_URL from the linked database below
+      - key: DATABASE_URL
+        fromDatabase:
+          name: dfm-db
+          property: connectionString
+
+      - key: SECRET_KEY
+        generateValue: true        # Render auto-generates a secure random value
+
+      - key: ALGORITHM
+        value: HS256
+
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: 10080
+
+      # ── Fill these in on the Render dashboard after first deploy ──────────────
+      - key: TEXTLOCAL_API_KEY
+        value: ""                  # Your TextLocal API key
+
+      - key: TEXTLOCAL_SENDER
+        value: DFMAGR
+
+      - key: FCM_SERVER_KEY
+        value: ""                  # Your Firebase server key
+
+      - key: FCM_SENDER_ID
+        value: ""                  # Your Firebase sender ID
+
+# ── PostgreSQL Database ─────────────────────────────────────────────────────────
+databases:
+  - name: dfm-db
+    databaseName: DigitalFarming
+    user: dfm_user
+    region: singapore              # must match the web service region above
+    plan: free                     # 1GB storage, free for 90 days then $7/mo
