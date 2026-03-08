@@ -4,10 +4,13 @@ Endpoints for self-registration, nearby equipment discovery,
 booking lifecycle, and live GPS tracking via WebSocket.
 """
 import json
+import logging
 import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
@@ -104,8 +107,9 @@ async def send_otp(body: SendOtpRequest, db: AsyncSession = Depends(get_db)):
     db.add(entry)
     await db.commit()
 
-    await send_sms(body.mobile, f"Your Haritham OTP is {otp}. Valid for 10 minutes.")
-    return {"status": "success", "message": "OTP sent"}
+    sms_result = await send_sms(body.mobile, f"Your Haritham OTP is {otp}. Valid for 10 minutes.")
+    logger.info("SMS result for %s: %s", body.mobile, sms_result)
+    return {"status": "success", "message": "OTP sent", "debug_sms": sms_result}
 
 
 @router.post("/verify-otp", summary="Verify OTP — returns token if user exists, or allows registration")
