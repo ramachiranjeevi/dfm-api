@@ -97,7 +97,7 @@ async def send_otp(body: SendOtpRequest, db: AsyncSession = Depends(get_db)):
         MobileNo=body.mobile,
         OTP=otp,
         CreatedBy="haritham",
-        CreatedOn=datetime.now(timezone.utc),
+        CreatedOn=datetime.utcnow(),
         IsDeleted=False,
         IsActive=True,
     )
