@@ -109,7 +109,12 @@ async def send_otp(body: SendOtpRequest, db: AsyncSession = Depends(get_db)):
 
     sms_result = await send_sms(body.mobile, f"Your Haritham OTP is {otp}. Valid for 10 minutes.")
     logger.info("SMS result for %s: %s", body.mobile, sms_result)
-    return {"status": "success", "message": "OTP sent", "debug_sms": sms_result}
+    sms_ok = sms_result.get("status") == "success"
+    return {
+        "status": "success",
+        "message": "OTP sent" if sms_ok else "SMS unavailable — use OTP below for testing",
+        "otp": None if sms_ok else otp,
+    }
 
 
 @router.post("/verify-otp", summary="Verify OTP — returns token if user exists, or allows registration")
