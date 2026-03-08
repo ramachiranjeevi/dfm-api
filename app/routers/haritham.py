@@ -175,7 +175,7 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     role_map = {"farmer": ROLE_FARMER, "owner": ROLE_OWNER, "both": ROLE_BOTH}
     role_code = role_map.get(body.role, ROLE_FARMER)
     ucode = f"H{uuid.uuid4().hex[:8].upper()}"
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
 
     user = Users(
         RoleCode=role_code,
@@ -313,7 +313,7 @@ async def toggle_availability(equipment_id: int, available: bool, db: AsyncSessi
 
 @router.post("/equipment/add", summary="Owner adds equipment listing")
 async def add_equipment(body: AddEquipmentRequest, db: AsyncSession = Depends(get_db)):
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     eq = EquipmentDetails(
         OwnerID=body.ownerId,
         EquipmentID=body.equipmentId,
@@ -335,7 +335,7 @@ async def add_equipment(body: AddEquipmentRequest, db: AsyncSession = Depends(ge
 @router.post("/orders/create", summary="Farmer creates a booking request")
 async def create_order(body: CreateOrderRequest, db: AsyncSession = Depends(get_db)):
     order_id = f"ORD{uuid.uuid4().hex[:8].upper()}"
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
 
     order = Orders(
         OrderID=order_id,
@@ -434,7 +434,7 @@ async def owner_orders(owner_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.patch("/orders/{order_id}/status", summary="Update order status")
 async def update_order_status(order_id: str, body: UpdateStatusRequest, db: AsyncSession = Depends(get_db)):
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     await db.execute(
         update(OrderStatus)
         .where(OrderStatus.OrderID == order_id)
