@@ -15,6 +15,7 @@ from app.routers import (
     customers,
     drivers,
     equipment,
+    haritham,
     market,
     notifications,
     orders,
@@ -63,6 +64,7 @@ app.include_router(customers.router)
 app.include_router(drivers.router)
 app.include_router(market.router)
 app.include_router(notifications.router)
+app.include_router(haritham.router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
