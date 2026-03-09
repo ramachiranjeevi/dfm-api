@@ -88,6 +88,9 @@ class UpdateLocationRequest(BaseModel):
     lat: float
     lng: float
 
+class UpdateRoleRequest(BaseModel):
+    role: str   # "owner" | "both"
+
 
 # ── OTP / Auth ────────────────────────────────────────────────────────────────
 
@@ -220,6 +223,30 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
             "lng": body.lng,
         }
     }
+
+
+@router.patch("/users/{user_id}/role", summary="Upgrade user role (e.g. farmer → both)")
+async def update_user_role(user_id: str, body: UpdateRoleRequest, db: AsyncSession = Depends(get_db)):
+    role_map = {"farmer": ROLE_FARMER, "owner": ROLE_OWNER, "both": ROLE_BOTH}
+    role_code = role_map.get(body.role)
+    if not role_code:
+        raise HTTPException(status_code=400, detail="Invalid role. Use 'farmer', 'owner', or 'both'.")
+
+    result = await db.execute(
+        select(Users).where(Users.UCode == user_id, Users.IsDeleted == False)
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    await db.execute(
+        update(Users).where(Users.UCode == user_id).values(RoleCode=role_code)
+    )
+    await db.execute(
+        update(Login).where(Login.UCode == user_id, Login.IsDeleted == False).values(RoleCode=role_code)
+    )
+    await db.commit()
+    return {"status": "success", "userId": user_id, "role": body.role}
 
 
 # ── Equipment helpers ─────────────────────────────────────────────────────────
