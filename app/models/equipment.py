@@ -32,6 +32,7 @@ class EquipmentDetails(Base):
     Quantity: Mapped[int | None] = mapped_column(Integer)
     Price: Mapped[float | None] = mapped_column(Numeric(10, 2))
     PriceUnit: Mapped[str | None] = mapped_column(String(20), default="acre")
+    ServiceRadiusKm: Mapped[float | None] = mapped_column(Numeric(6, 1), default=10.0)
     CreatedBy: Mapped[str | None] = mapped_column(String(100))
     CreatedOn: Mapped[datetime | None] = mapped_column(DateTime)
     IsDeleted: Mapped[bool | None] = mapped_column(Boolean, default=False)

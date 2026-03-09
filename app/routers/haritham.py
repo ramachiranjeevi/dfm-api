@@ -39,6 +39,20 @@ STATUS_ACCEPTED  = 1
 STATUS_CANCELLED = 2
 STATUS_COMPLETED = 3
 
+# ── Default service radius (km) by equipment type ─────────────────────────────
+TYPE_DEFAULT_RADIUS_KM: dict[str, float] = {
+    "drone":       40.0,
+    "harvester":   20.0,
+    "sprayer":     15.0,
+    "tractor":     10.0,
+    "plough":       8.0,
+    "water pump":   5.0,
+}
+
+def _default_radius(equipment_name: str) -> float:
+    return TYPE_DEFAULT_RADIUS_KM.get((equipment_name or "").lower(), 10.0)
+
+
 # ── Haversine helper ──────────────────────────────────────────────────────────
 def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     R = 6371.0
@@ -69,7 +83,8 @@ class AddEquipmentRequest(BaseModel):
     equipmentId: int
     subEquipmentId: int
     price: float
-    priceUnit: str = "acre"  # acre | day | hour
+    priceUnit: str = "acre"          # acre | day | hour
+    serviceRadius: float = 10.0      # km — how far owner is willing to travel
 
 class CreateOrderRequest(BaseModel):
     farmerId: str
@@ -320,12 +335,13 @@ async def _ensure_price_columns(db: AsyncSession) -> None:
     try:
         await db.execute(text("""
             ALTER TABLE "EquipmentDetails"
-            ADD COLUMN IF NOT EXISTS "Price"     NUMERIC(10,2),
-            ADD COLUMN IF NOT EXISTS "PriceUnit" VARCHAR(20) DEFAULT 'acre'
+            ADD COLUMN IF NOT EXISTS "Price"            NUMERIC(10,2),
+            ADD COLUMN IF NOT EXISTS "PriceUnit"        VARCHAR(20) DEFAULT 'acre',
+            ADD COLUMN IF NOT EXISTS "ServiceRadiusKm"  NUMERIC(6,1) DEFAULT 10.0
         """))
         await db.commit()
         _price_cols_migrated = True
-        logger.info("EquipmentDetails price columns ensured.")
+        logger.info("EquipmentDetails price/radius columns ensured.")
     except Exception as exc:
         logger.warning("Price column migration skipped: %s", exc)
         await db.rollback()
@@ -355,8 +371,8 @@ async def equipment_catalog(db: AsyncSession = Depends(get_db)):
     return {"status": "success", "catalog": list(types.values())}
 
 
-@router.get("/equipment/nearby", summary="Find available equipment within radius (km)")
-async def nearby_equipment(lat: float, lng: float, radius: float = 5.0, db: AsyncSession = Depends(get_db)):
+@router.get("/equipment/nearby", summary="Find equipment that can serve the farmer's location")
+async def nearby_equipment(lat: float, lng: float, radius: float = 50.0, db: AsyncSession = Depends(get_db)):
     """
     Uses Haversine formula to find equipment owners within `radius` km.
     Returns equipment list with distance, owner name, price.
@@ -384,7 +400,13 @@ async def nearby_equipment(lat: float, lng: float, radius: float = 5.0, db: Asyn
         owner_lng = float(owner.Long)
         dist = haversine_km(lat, lng, owner_lat, owner_lng)
 
-        if dist <= radius:
+        # Use the equipment's own service radius; fall back to type default
+        eq_radius = float(eq_detail.ServiceRadiusKm) if eq_detail.ServiceRadiusKm else \
+                    _default_radius(eq_catalog.Equipment or "")
+
+        # Farmer must be within the owner's declared service area
+        # `radius` param acts as an upper-bound cap (default 50 km)
+        if dist <= eq_radius and dist <= radius:
             nearby.append({
                 "id": eq_detail.ID,
                 "equipmentId": eq_detail.EquipmentID,
@@ -401,6 +423,7 @@ async def nearby_equipment(lat: float, lng: float, radius: float = 5.0, db: Asyn
                 "available": bool(eq_detail.IsActive),
                 "price": float(eq_detail.Price) if eq_detail.Price else None,
                 "priceUnit": eq_detail.PriceUnit or "acre",
+                "serviceRadius": eq_radius,
             })
 
     # Sort by distance
@@ -431,6 +454,7 @@ async def owner_equipment(owner_id: str, db: AsyncSession = Depends(get_db)):
             "regNo": eq.VehicleRegistrationNo,
             "price": float(eq.Price) if eq.Price else None,
             "priceUnit": eq.PriceUnit or "acre",
+            "serviceRadius": float(eq.ServiceRadiusKm) if eq.ServiceRadiusKm else None,
         })
     return {"status": "success", "equipment": equipment}
 
@@ -457,6 +481,7 @@ async def add_equipment(body: AddEquipmentRequest, db: AsyncSession = Depends(ge
         Quantity=1,
         Price=body.price,
         PriceUnit=body.priceUnit,
+        ServiceRadiusKm=body.serviceRadius,
         CreatedBy=body.ownerId,
         CreatedOn=now,
         IsDeleted=False,
