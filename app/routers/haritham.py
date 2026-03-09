@@ -21,8 +21,9 @@ from app.core.security import create_access_token, generate_otp
 from app.database import get_db
 from app.models.equipment import AgricultureEquipment, EquipmentDetails
 from app.models.order import Orders, OrderStatus
-from app.models.user import Login, Users, VerifyOTP
+from app.models.user import DeviceDetails, Login, Users, VerifyOTP
 from app.services.sms import send_sms
+from app.services.webpush import send_push_to_user
 
 router = APIRouter(prefix="/haritham", tags=["Haritham"])
 
@@ -90,6 +91,25 @@ class UpdateLocationRequest(BaseModel):
 
 class UpdateRoleRequest(BaseModel):
     role: str   # "owner" | "both"
+
+class PushSubscribeRequest(BaseModel):
+    mobile: str
+    subscription: dict   # browser PushSubscription.toJSON()
+
+
+# ── Notification helper ────────────────────────────────────────────────────────
+
+async def _notify(mobile: str, title: str, body: str, db: AsyncSession) -> None:
+    """Fire SMS + Web Push to a user. Both are best-effort — failures are logged only."""
+    sms_msg = f"{title}: {body}"
+    try:
+        await send_sms(mobile, sms_msg)
+    except Exception as exc:
+        logger.warning("SMS notify failed for %s: %s", mobile, exc)
+    try:
+        await send_push_to_user(mobile, title, body, db)
+    except Exception as exc:
+        logger.warning("Push notify failed for %s: %s", mobile, exc)
 
 
 # ── OTP / Auth ────────────────────────────────────────────────────────────────
@@ -247,6 +267,45 @@ async def update_user_role(user_id: str, body: UpdateRoleRequest, db: AsyncSessi
     )
     await db.commit()
     return {"status": "success", "userId": user_id, "role": body.role}
+
+
+@router.post("/push/subscribe", summary="Save browser Web Push subscription for a user")
+async def push_subscribe(body: PushSubscribeRequest, db: AsyncSession = Depends(get_db)):
+    import json as _json
+    from datetime import datetime as _dt
+
+    now = _dt.utcnow()
+    sub_json = _json.dumps(body.subscription)
+
+    # Check if subscription already stored for this mobile
+    result = await db.execute(
+        select(DeviceDetails)
+        .where(DeviceDetails.MobileNo == body.mobile, DeviceDetails.DeviceType == "webpush",
+               DeviceDetails.IsDeleted == False)
+        .limit(1)
+    )
+    existing = result.scalar_one_or_none()
+    if existing:
+        existing.RegistrationToken = sub_json
+        existing.Modifiedon = now
+    else:
+        db.add(DeviceDetails(
+            MobileNo=body.mobile,
+            RegistrationToken=sub_json,
+            DeviceType="webpush",
+            CreatedBy="haritham",
+            CreatedOn=now,
+            IsDeleted=False,
+            IsActive=True,
+        ))
+    await db.commit()
+    return {"status": "success", "message": "Push subscription saved"}
+
+
+@router.get("/push/vapid-public-key", summary="Return VAPID public key for browser subscription")
+async def vapid_public_key():
+    from app.config import settings as _s
+    return {"publicKey": _s.VAPID_PUBLIC_KEY}
 
 
 # ── Equipment helpers ─────────────────────────────────────────────────────────
@@ -444,6 +503,27 @@ async def create_order(body: CreateOrderRequest, db: AsyncSession = Depends(get_
     db.add(order_status)
     await db.commit()
 
+    # ── Notify owner via SMS + Web Push ───────────────────────────────────────
+    try:
+        owner_result = await db.execute(
+            select(Users).where(Users.UCode == body.ownerId, Users.IsDeleted == False)
+        )
+        owner = owner_result.scalar_one_or_none()
+        farmer_result = await db.execute(
+            select(Users).where(Users.UCode == body.farmerId, Users.IsDeleted == False)
+        )
+        farmer = farmer_result.scalar_one_or_none()
+        if owner and farmer:
+            date_str = body.scheduleDate[:10] if body.scheduleDate else "TBD"
+            await _notify(
+                mobile=owner.MobileNo,
+                title="New Booking Request",
+                body=f"{farmer.UserName} from {farmer.City or 'nearby'} needs your equipment on {date_str}. Open Haritham to accept.",
+                db=db,
+            )
+    except Exception as exc:
+        logger.warning("Order create notify failed: %s", exc)
+
     return {"status": "success", "orderId": order_id}
 
 
@@ -532,6 +612,52 @@ async def update_order_status(order_id: str, body: UpdateStatusRequest, db: Asyn
         await db.execute(update(Orders).where(Orders.OrderID == order_id).values(**updates))
 
     await db.commit()
+
+    # ── Notify relevant party via SMS + Web Push ───────────────────────────────
+    try:
+        order_res = await db.execute(
+            select(Orders).where(Orders.OrderID == order_id)
+        )
+        order = order_res.scalar_one_or_none()
+        if order:
+            farmer_res = await db.execute(select(Users).where(Users.UCode == order.UserId))
+            farmer = farmer_res.scalar_one_or_none()
+            owner_res  = await db.execute(select(Users).where(Users.UCode == order.OwnerId))
+            owner  = owner_res.scalar_one_or_none()
+
+            if body.status == STATUS_ACCEPTED and farmer:
+                await _notify(
+                    mobile=farmer.MobileNo,
+                    title="Booking Accepted! ✅",
+                    body=f"Your equipment request was accepted by {owner.UserName if owner else 'the owner'}. They will arrive on the scheduled date.",
+                    db=db,
+                )
+            elif body.status == STATUS_CANCELLED:
+                # Who cancelled? Notify the other party
+                if body.updatedBy == order.UserId and owner:   # farmer cancelled → notify owner
+                    await _notify(
+                        mobile=owner.MobileNo,
+                        title="Booking Cancelled",
+                        body=f"{farmer.UserName if farmer else 'The farmer'} cancelled their equipment request.",
+                        db=db,
+                    )
+                elif farmer:  # owner cancelled → notify farmer
+                    await _notify(
+                        mobile=farmer.MobileNo,
+                        title="Booking Cancelled",
+                        body="The owner cancelled your equipment request. Please search for another equipment nearby.",
+                        db=db,
+                    )
+            elif body.status == STATUS_COMPLETED and farmer:
+                await _notify(
+                    mobile=farmer.MobileNo,
+                    title="Job Completed ✅",
+                    body="Your equipment job is marked complete. Thank you for using Haritham!",
+                    db=db,
+                )
+    except Exception as exc:
+        logger.warning("Order status notify failed: %s", exc)
+
     return {"status": "success", "orderId": order_id, "newStatus": body.status}
 
 

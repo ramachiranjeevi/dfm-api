@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     FCM_SERVER_KEY: str = ""
     FCM_SENDER_ID: str = ""
 
+    # Web Push (VAPID)
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_EMAIL: str = "mailto:admin@haritham.app"
+
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
     def normalise_db_url(cls, v: str) -> str:
