@@ -30,6 +30,8 @@ class EquipmentDetails(Base):
     SubEquipmentID: Mapped[int | None] = mapped_column(Integer)
     VehicleRegistrationNo: Mapped[str | None] = mapped_column(String(50))
     Quantity: Mapped[int | None] = mapped_column(Integer)
+    Price: Mapped[float | None] = mapped_column(Numeric(10, 2))
+    PriceUnit: Mapped[str | None] = mapped_column(String(20), default="acre")
     CreatedBy: Mapped[str | None] = mapped_column(String(100))
     CreatedOn: Mapped[datetime | None] = mapped_column(DateTime)
     IsDeleted: Mapped[bool | None] = mapped_column(Boolean, default=False)

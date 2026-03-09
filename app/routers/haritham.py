@@ -222,7 +222,52 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     }
 
 
+# ── Equipment helpers ─────────────────────────────────────────────────────────
+
+_price_cols_migrated = False
+
+async def _ensure_price_columns(db: AsyncSession) -> None:
+    """Idempotent: add Price / PriceUnit to EquipmentDetails if they don't exist yet."""
+    global _price_cols_migrated
+    if _price_cols_migrated:
+        return
+    try:
+        await db.execute(text("""
+            ALTER TABLE "EquipmentDetails"
+            ADD COLUMN IF NOT EXISTS "Price"     NUMERIC(10,2),
+            ADD COLUMN IF NOT EXISTS "PriceUnit" VARCHAR(20) DEFAULT 'acre'
+        """))
+        await db.commit()
+        _price_cols_migrated = True
+        logger.info("EquipmentDetails price columns ensured.")
+    except Exception as exc:
+        logger.warning("Price column migration skipped: %s", exc)
+        await db.rollback()
+
+
 # ── Equipment ─────────────────────────────────────────────────────────────────
+
+@router.get("/equipment/catalog", summary="Return all equipment types & sub-types from catalog")
+async def equipment_catalog(db: AsyncSession = Depends(get_db)):
+    await _ensure_price_columns(db)
+    result = await db.execute(
+        select(AgricultureEquipment)
+        .where(AgricultureEquipment.IsDeleted == False, AgricultureEquipment.IsActive == True)
+        .order_by(AgricultureEquipment.EquipmentID, AgricultureEquipment.SubEquipmentID)
+    )
+    rows = result.scalars().all()
+
+    types: dict[int, dict] = {}
+    for row in rows:
+        eid = row.EquipmentID
+        if eid not in types:
+            types[eid] = {"equipmentId": eid, "name": row.Equipment or "", "subTypes": []}
+        types[eid]["subTypes"].append({
+            "subEquipmentId": row.SubEquipmentID,
+            "name": row.SubEquipment or "",
+        })
+    return {"status": "success", "catalog": list(types.values())}
+
 
 @router.get("/equipment/nearby", summary="Find available equipment within radius (km)")
 async def nearby_equipment(lat: float, lng: float, radius: float = 5.0, db: AsyncSession = Depends(get_db)):
@@ -268,6 +313,8 @@ async def nearby_equipment(lat: float, lng: float, radius: float = 5.0, db: Asyn
                 "ownerLat": owner_lat,
                 "ownerLng": owner_lng,
                 "available": bool(eq_detail.IsActive),
+                "price": float(eq_detail.Price) if eq_detail.Price else None,
+                "priceUnit": eq_detail.PriceUnit or "acre",
             })
 
     # Sort by distance
@@ -296,6 +343,8 @@ async def owner_equipment(owner_id: str, db: AsyncSession = Depends(get_db)):
             "image": catalog.Image,
             "available": bool(eq.IsActive),
             "regNo": eq.VehicleRegistrationNo,
+            "price": float(eq.Price) if eq.Price else None,
+            "priceUnit": eq.PriceUnit or "acre",
         })
     return {"status": "success", "equipment": equipment}
 
@@ -313,12 +362,15 @@ async def toggle_availability(equipment_id: int, available: bool, db: AsyncSessi
 
 @router.post("/equipment/add", summary="Owner adds equipment listing")
 async def add_equipment(body: AddEquipmentRequest, db: AsyncSession = Depends(get_db)):
+    await _ensure_price_columns(db)
     now = datetime.utcnow()
     eq = EquipmentDetails(
         OwnerID=body.ownerId,
         EquipmentID=body.equipmentId,
         SubEquipmentID=body.subEquipmentId,
         Quantity=1,
+        Price=body.price,
+        PriceUnit=body.priceUnit,
         CreatedBy=body.ownerId,
         CreatedOn=now,
         IsDeleted=False,
