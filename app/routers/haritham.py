@@ -349,9 +349,68 @@ async def _ensure_price_columns(db: AsyncSession) -> None:
 
 # ── Equipment ─────────────────────────────────────────────────────────────────
 
+_drone_seeded = False
+
+async def _ensure_drone_catalog(db: AsyncSession):
+    """Seed Drone into AgricultureEquipment catalog if not already present."""
+    global _drone_seeded
+    if _drone_seeded:
+        return
+    try:
+        exists = await db.execute(
+            select(AgricultureEquipment)
+            .where(AgricultureEquipment.IsDeleted == False)
+            .where(AgricultureEquipment.Equipment.ilike("drone"))
+        )
+        if exists.scalars().first():
+            _drone_seeded = True
+            return
+
+        # Find max EquipmentID to assign next id
+        max_eid_res = await db.execute(
+            select(AgricultureEquipment.EquipmentID)
+            .where(AgricultureEquipment.IsDeleted == False)
+            .order_by(AgricultureEquipment.EquipmentID.desc())
+        )
+        max_eid = max_eid_res.scalars().first() or 0
+        drone_eid = max_eid + 1
+
+        max_sid_res = await db.execute(
+            select(AgricultureEquipment.SubEquipmentID)
+            .where(AgricultureEquipment.IsDeleted == False)
+            .order_by(AgricultureEquipment.SubEquipmentID.desc())
+        )
+        max_sid = max_sid_res.scalars().first() or 0
+
+        drone_subtypes = [
+            "Pesticide Spraying Drone",
+            "Seed Sowing Drone",
+            "Fertilizer Spraying Drone",
+        ]
+        now = datetime.utcnow()
+        for i, sub in enumerate(drone_subtypes, start=1):
+            db.add(AgricultureEquipment(
+                EquipmentID=drone_eid,
+                Equipment="Drone",
+                SubEquipmentID=max_sid + i,
+                SubEquipment=sub,
+                CreatedBy="system",
+                CreatedOn=now,
+                IsDeleted=False,
+                IsActive=True,
+            ))
+        await db.commit()
+        _drone_seeded = True
+        logger.info("Drone equipment seeded into catalog.")
+    except Exception as exc:
+        logger.warning("Drone catalog seed skipped: %s", exc)
+        await db.rollback()
+
+
 @router.get("/equipment/catalog", summary="Return all equipment types & sub-types from catalog")
 async def equipment_catalog(db: AsyncSession = Depends(get_db)):
     await _ensure_price_columns(db)
+    await _ensure_drone_catalog(db)
     result = await db.execute(
         select(AgricultureEquipment)
         .where(AgricultureEquipment.IsDeleted == False, AgricultureEquipment.IsActive == True)
