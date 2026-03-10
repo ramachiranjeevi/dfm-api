@@ -104,6 +104,16 @@ class UpdateLocationRequest(BaseModel):
     lat: float
     lng: float
 
+class UpdateEquipmentRequest(BaseModel):
+    price: float | None = None
+    priceUnit: str | None = None
+    serviceRadius: float | None = None
+    regNo: str | None = None
+
+class UpdateProfileRequest(BaseModel):
+    name: str | None = None
+    village: str | None = None
+
 class UpdateRoleRequest(BaseModel):
     role: str   # "owner" | "both"
 
@@ -303,6 +313,22 @@ async def update_user_location(user_id: str, body: UpdateUserLocationRequest, db
     await db.commit()
     logger.info("Location updated for user %s → %.5f, %.5f", user_id, body.lat, body.lng)
     return {"status": "success", "lat": body.lat, "lng": body.lng}
+
+
+@router.patch("/users/{user_id}/profile", summary="Update user name and/or village")
+async def update_user_profile(user_id: str, body: UpdateProfileRequest, db: AsyncSession = Depends(get_db)):
+    updates: dict[str, Any] = {}
+    if body.name is not None:
+        updates["UserName"] = body.name
+    if body.village is not None:
+        updates["City"] = body.village
+    if not updates:
+        return {"status": "success"}
+    await db.execute(update(Users).where(Users.UCode == user_id, Users.IsDeleted == False).values(**updates))
+    if body.name is not None:
+        await db.execute(update(Login).where(Login.UCode == user_id, Login.IsDeleted == False).values(UserName=body.name))
+    await db.commit()
+    return {"status": "success"}
 
 
 @router.post("/push/subscribe", summary="Save browser Web Push subscription for a user")
@@ -550,6 +576,23 @@ async def toggle_availability(equipment_id: int, available: bool, db: AsyncSessi
     return {"status": "success", "available": available}
 
 
+@router.patch("/equipment/{equipment_id}", summary="Edit equipment price, radius, or reg no")
+async def update_equipment(equipment_id: int, body: UpdateEquipmentRequest, db: AsyncSession = Depends(get_db)):
+    updates: dict[str, Any] = {}
+    if body.price is not None:
+        updates["Price"] = body.price
+    if body.priceUnit is not None:
+        updates["PriceUnit"] = body.priceUnit
+    if body.serviceRadius is not None:
+        updates["ServiceRadiusKm"] = body.serviceRadius
+    if body.regNo is not None:
+        updates["VehicleRegistrationNo"] = body.regNo
+    if updates:
+        await db.execute(update(EquipmentDetails).where(EquipmentDetails.ID == equipment_id).values(**updates))
+        await db.commit()
+    return {"status": "success"}
+
+
 @router.post("/equipment/add", summary="Owner adds equipment listing")
 async def add_equipment(body: AddEquipmentRequest, db: AsyncSession = Depends(get_db)):
     await _ensure_price_columns(db)
@@ -580,6 +623,23 @@ async def create_order(body: CreateOrderRequest, db: AsyncSession = Depends(get_
     # Prevent an owner from booking their own equipment
     if body.farmerId == body.ownerId:
         raise HTTPException(status_code=400, detail="You cannot book your own equipment.")
+
+    # Prevent double-booking: same equipment + same date with an accepted order
+    conflict_result = await db.execute(
+        select(Orders)
+        .join(OrderStatus, OrderStatus.OrderID == Orders.OrderID)
+        .where(
+            Orders.SubEquipmentId == body.equipmentDetailId,
+            Orders.IsDeleted == False,
+            OrderStatus.StatusID == STATUS_ACCEPTED,
+            Orders.OrderRequiredOn == body.scheduleDate,
+        )
+    )
+    if conflict_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=409,
+            detail="This equipment is already booked for that date. Please choose a different date."
+        )
 
     order_id = f"ORD{uuid.uuid4().hex[:8].upper()}"
     now = datetime.utcnow()
@@ -674,15 +734,19 @@ async def farmer_orders(farmer_id: str, db: AsyncSession = Depends(get_db)):
 @router.get("/orders/owner/{owner_id}", summary="Get all orders for an equipment owner")
 async def owner_orders(owner_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(Orders, OrderStatus, Users)
+        select(Orders, OrderStatus, Users, AgricultureEquipment, EquipmentDetails)
         .join(OrderStatus, OrderStatus.OrderID == Orders.OrderID)
         .join(Users, Users.UCode == Orders.UserId)
+        .outerjoin(EquipmentDetails, EquipmentDetails.ID == Orders.SubEquipmentId)
+        .outerjoin(AgricultureEquipment,
+            (AgricultureEquipment.EquipmentID == EquipmentDetails.EquipmentID) &
+            (AgricultureEquipment.SubEquipmentID == EquipmentDetails.SubEquipmentID))
         .where(Orders.OwnerId == owner_id, Orders.IsDeleted == False)
         .order_by(Orders.OrderCreatedOn.desc())
     )
     orders = []
     seen = set()
-    for order, os, farmer in result.all():
+    for order, os, farmer, eq, eq_detail in result.all():
         if order.OrderID in seen:
             continue
         seen.add(order.OrderID)
@@ -699,9 +763,50 @@ async def owner_orders(owner_id: str, db: AsyncSession = Depends(get_db)):
             "statusId": os.StatusID,
             "farmerLat": float(order.Lat) if order.Lat else None,
             "farmerLng": float(order.Long) if order.Long else None,
+            "equipment": eq.SubEquipment if eq else None,
+            "equipmentType": eq.Equipment if eq else None,
+            "price": float(eq_detail.Price) if eq_detail and eq_detail.Price else None,
+            "priceUnit": eq_detail.PriceUnit if eq_detail else None,
             "createdOn": order.OrderCreatedOn.isoformat() if order.OrderCreatedOn else None,
         })
     return {"status": "success", "orders": orders}
+
+
+@router.get("/orders/{order_id}", summary="Get single order details (for tracking page)")
+async def get_order(order_id: str, db: AsyncSession = Depends(get_db)):
+    from sqlalchemy.orm import aliased
+    OwnerUser = aliased(Users)
+    FarmerUser = aliased(Users)
+    result = await db.execute(
+        select(Orders, OrderStatus, AgricultureEquipment, FarmerUser, OwnerUser)
+        .join(OrderStatus, OrderStatus.OrderID == Orders.OrderID)
+        .outerjoin(AgricultureEquipment, AgricultureEquipment.SubEquipmentID == Orders.SubEquipmentId)
+        .outerjoin(FarmerUser, FarmerUser.UCode == Orders.UserId)
+        .outerjoin(OwnerUser, OwnerUser.UCode == Orders.OwnerId)
+        .where(Orders.OrderID == order_id, Orders.IsDeleted == False)
+    )
+    row = result.first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    order, os, eq, farmer, owner = row
+    status_map = {0: "pending", 1: "active", 2: "cancelled", 3: "completed"}
+    return {
+        "orderId": order.OrderID,
+        "status": status_map.get(os.StatusID, "pending"),
+        "statusId": os.StatusID,
+        "scheduleDate": order.OrderRequiredOn,
+        "notes": order.Comments,
+        "farmerLat": float(order.Lat) if order.Lat else None,
+        "farmerLng": float(order.Long) if order.Long else None,
+        "farmerName": farmer.UserName if farmer else None,
+        "farmerMobile": farmer.MobileNo if farmer else None,
+        "ownerId": order.OwnerId,
+        "ownerName": owner.UserName if owner else None,
+        "ownerMobile": owner.MobileNo if owner else None,
+        "equipment": eq.SubEquipment if eq else None,
+        "equipmentType": eq.Equipment if eq else None,
+        "createdOn": order.OrderCreatedOn.isoformat() if order.OrderCreatedOn else None,
+    }
 
 
 @router.patch("/orders/{order_id}/status", summary="Update order status")
