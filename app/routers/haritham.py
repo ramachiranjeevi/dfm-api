@@ -577,6 +577,10 @@ async def add_equipment(body: AddEquipmentRequest, db: AsyncSession = Depends(ge
 
 @router.post("/orders/create", summary="Farmer creates a booking request")
 async def create_order(body: CreateOrderRequest, db: AsyncSession = Depends(get_db)):
+    # Prevent an owner from booking their own equipment
+    if body.farmerId == body.ownerId:
+        raise HTTPException(status_code=400, detail="You cannot book your own equipment.")
+
     order_id = f"ORD{uuid.uuid4().hex[:8].upper()}"
     now = datetime.utcnow()
 
