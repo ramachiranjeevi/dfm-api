@@ -107,6 +107,10 @@ class UpdateLocationRequest(BaseModel):
 class UpdateRoleRequest(BaseModel):
     role: str   # "owner" | "both"
 
+class UpdateUserLocationRequest(BaseModel):
+    lat: float
+    lng: float
+
 class PushSubscribeRequest(BaseModel):
     mobile: str
     subscription: dict   # browser PushSubscription.toJSON()
@@ -282,6 +286,23 @@ async def update_user_role(user_id: str, body: UpdateRoleRequest, db: AsyncSessi
     )
     await db.commit()
     return {"status": "success", "userId": user_id, "role": body.role}
+
+
+@router.patch("/users/{user_id}/location", summary="Update user GPS location (used to place equipment on map)")
+async def update_user_location(user_id: str, body: UpdateUserLocationRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Users).where(Users.UCode == user_id, Users.IsDeleted == False)
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    await db.execute(
+        update(Users).where(Users.UCode == user_id).values(Lat=body.lat, Long=body.lng)
+    )
+    await db.commit()
+    logger.info("Location updated for user %s → %.5f, %.5f", user_id, body.lat, body.lng)
+    return {"status": "success", "lat": body.lat, "lng": body.lng}
 
 
 @router.post("/push/subscribe", summary="Save browser Web Push subscription for a user")
