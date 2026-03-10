@@ -478,7 +478,7 @@ async def equipment_catalog(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/equipment/nearby", summary="Find equipment that can serve the farmer's location")
-async def nearby_equipment(lat: float, lng: float, radius: float = 50.0, db: AsyncSession = Depends(get_db)):
+async def nearby_equipment(lat: float, lng: float, radius: float = 50.0, available_date: str | None = None, db: AsyncSession = Depends(get_db)):
     """
     Uses Haversine formula to find equipment owners within `radius` km.
     Returns equipment list with distance, owner name, price.
@@ -534,6 +534,24 @@ async def nearby_equipment(lat: float, lng: float, radius: float = 50.0, db: Asy
 
     # Sort by distance
     nearby.sort(key=lambda x: x["distance"])
+
+    # Filter out equipment already booked (accepted) on the requested date
+    if available_date:
+        try:
+            booked_result = await db.execute(
+                select(Orders.SubEquipmentId)
+                .join(OrderStatus, OrderStatus.OrderID == Orders.OrderID)
+                .where(
+                    Orders.IsDeleted == False,
+                    OrderStatus.StatusID == STATUS_ACCEPTED,
+                    Orders.OrderRequiredOn == available_date,
+                )
+            )
+            booked_ids = {row[0] for row in booked_result.all()}
+            nearby = [e for e in nearby if e["id"] not in booked_ids]
+        except Exception as exc:
+            logger.warning("available_date filter failed: %s", exc)
+
     return {"status": "success", "count": len(nearby), "equipment": nearby}
 
 
@@ -719,6 +737,7 @@ async def farmer_orders(farmer_id: str, db: AsyncSession = Depends(get_db)):
             "orderId": order.OrderID,
             "ownerId": order.OwnerId,
             "ownerName": owner.UserName if owner else None,
+            "ownerMobile": owner.MobileNo if owner else None,
             "scheduleDate": order.OrderRequiredOn,
             "notes": order.Comments,
             "status": status_map.get(os.StatusID, "pending"),
@@ -727,6 +746,7 @@ async def farmer_orders(farmer_id: str, db: AsyncSession = Depends(get_db)):
             "equipmentType": eq.Equipment if eq else None,
             "image": eq.Image if eq else None,
             "createdOn": order.OrderCreatedOn.isoformat() if order.OrderCreatedOn else None,
+            "rating": getattr(order, "Rating", None),
         })
     return {"status": "success", "orders": orders}
 
@@ -877,6 +897,42 @@ async def update_order_status(order_id: str, body: UpdateStatusRequest, db: Asyn
         logger.warning("Order status notify failed: %s", exc)
 
     return {"status": "success", "orderId": order_id, "newStatus": body.status}
+
+
+# ── Rating ────────────────────────────────────────────────────────────────────
+
+_rating_col_migrated = False
+
+async def _ensure_rating_column(db: AsyncSession) -> None:
+    """Idempotent: add Rating column to Orders if it doesn't exist."""
+    global _rating_col_migrated
+    if _rating_col_migrated:
+        return
+    try:
+        await db.execute(text('ALTER TABLE "Orders" ADD COLUMN IF NOT EXISTS "Rating" INTEGER'))
+        await db.commit()
+        _rating_col_migrated = True
+        logger.info("Orders.Rating column ensured.")
+    except Exception as exc:
+        logger.warning("Rating column migration skipped: %s", exc)
+        await db.rollback()
+
+
+class RateOrderRequest(BaseModel):
+    rating: int   # 1–5
+    ratedBy: str
+
+
+@router.patch("/orders/{order_id}/rating", summary="Farmer rates a completed order (1–5 stars)")
+async def rate_order(order_id: str, body: RateOrderRequest, db: AsyncSession = Depends(get_db)):
+    if body.rating < 1 or body.rating > 5:
+        raise HTTPException(status_code=400, detail="Rating must be between 1 and 5.")
+    await _ensure_rating_column(db)
+    await db.execute(
+        update(Orders).where(Orders.OrderID == order_id).values(**{"Rating": body.rating})
+    )
+    await db.commit()
+    return {"status": "success", "orderId": order_id, "rating": body.rating}
 
 
 # ── Live Tracking (WebSocket) ─────────────────────────────────────────────────
