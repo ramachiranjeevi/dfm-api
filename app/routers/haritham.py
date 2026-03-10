@@ -634,16 +634,19 @@ async def create_order(body: CreateOrderRequest, db: AsyncSession = Depends(get_
 
 @router.get("/orders/farmer/{farmer_id}", summary="Get all orders for a farmer")
 async def farmer_orders(farmer_id: str, db: AsyncSession = Depends(get_db)):
+    from sqlalchemy.orm import aliased
+    OwnerUser = aliased(Users)
     result = await db.execute(
-        select(Orders, OrderStatus, AgricultureEquipment)
+        select(Orders, OrderStatus, AgricultureEquipment, OwnerUser)
         .join(OrderStatus, OrderStatus.OrderID == Orders.OrderID)
         .outerjoin(AgricultureEquipment, AgricultureEquipment.SubEquipmentID == Orders.SubEquipmentId)
+        .outerjoin(OwnerUser, OwnerUser.UCode == Orders.OwnerId)
         .where(Orders.UserId == farmer_id, Orders.IsDeleted == False)
         .order_by(Orders.OrderCreatedOn.desc())
     )
     orders = []
     seen = set()
-    for order, os, eq in result.all():
+    for order, os, eq, owner in result.all():
         if order.OrderID in seen:
             continue
         seen.add(order.OrderID)
@@ -651,6 +654,7 @@ async def farmer_orders(farmer_id: str, db: AsyncSession = Depends(get_db)):
         orders.append({
             "orderId": order.OrderID,
             "ownerId": order.OwnerId,
+            "ownerName": owner.UserName if owner else None,
             "scheduleDate": order.OrderRequiredOn,
             "notes": order.Comments,
             "status": status_map.get(os.StatusID, "pending"),
