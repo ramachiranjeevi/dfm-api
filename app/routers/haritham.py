@@ -7,14 +7,14 @@ import json
 import logging
 import math
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, generate_otp
@@ -897,6 +897,117 @@ async def update_order_status(order_id: str, body: UpdateStatusRequest, db: Asyn
         logger.warning("Order status notify failed: %s", exc)
 
     return {"status": "success", "orderId": order_id, "newStatus": body.status}
+
+
+# ── Admin Analytics ───────────────────────────────────────────────────────────
+
+@router.get("/admin/analytics", summary="Admin analytics — users, orders, equipment, top villages")
+async def admin_analytics(db: AsyncSession = Depends(get_db)):
+    now      = datetime.utcnow()
+    ago_7d   = now - timedelta(days=7)
+    ago_30d  = now - timedelta(days=30)
+
+    role_label = {ROLE_FARMER: "farmer", ROLE_OWNER: "owner", ROLE_BOTH: "both", ROLE_ADMIN: "admin"}
+
+    # ── Users by role ─────────────────────────────────────────────────────────
+    role_rows = (await db.execute(
+        select(Users.RoleCode, func.count(Users.ID).label("n"))
+        .where(Users.IsDeleted == False)
+        .group_by(Users.RoleCode)
+    )).all()
+
+    by_role = {v: 0 for v in role_label.values()}
+    total_users = 0
+    for rc, cnt in role_rows:
+        key = role_label.get(rc, f"role_{rc}")
+        by_role[key] = by_role.get(key, 0) + cnt
+        total_users += cnt
+
+    # ── New registrations ─────────────────────────────────────────────────────
+    new_7d  = (await db.execute(select(func.count(Users.ID)).where(Users.IsDeleted == False, Users.CreatedOn >= ago_7d))).scalar() or 0
+    new_30d = (await db.execute(select(func.count(Users.ID)).where(Users.IsDeleted == False, Users.CreatedOn >= ago_30d))).scalar() or 0
+
+    # ── Daily signups — last 14 days (raw rows, grouped in Python) ────────────
+    daily_rows = (await db.execute(
+        select(Users.CreatedOn)
+        .where(Users.IsDeleted == False, Users.CreatedOn >= now - timedelta(days=14))
+        .order_by(Users.CreatedOn)
+    )).scalars().all()
+
+    daily_map: dict[str, int] = {}
+    for ts in daily_rows:
+        if ts:
+            day = ts.strftime("%d %b")
+            daily_map[day] = daily_map.get(day, 0) + 1
+    daily_signups = [{"date": d, "count": c} for d, c in daily_map.items()]
+
+    # ── Orders by status ──────────────────────────────────────────────────────
+    status_rows = (await db.execute(
+        select(OrderStatus.StatusID, func.count(Orders.OrderID).label("n"))
+        .join(Orders, Orders.OrderID == OrderStatus.OrderID)
+        .where(Orders.IsDeleted == False)
+        .group_by(OrderStatus.StatusID)
+    )).all()
+
+    order_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+    for sid, cnt in status_rows:
+        order_counts[sid] = cnt
+
+    # ── Equipment ─────────────────────────────────────────────────────────────
+    equip_active   = (await db.execute(select(func.count(EquipmentDetails.ID)).where(EquipmentDetails.IsDeleted == False, EquipmentDetails.IsActive == True))).scalar() or 0
+    equip_inactive = (await db.execute(select(func.count(EquipmentDetails.ID)).where(EquipmentDetails.IsDeleted == False, EquipmentDetails.IsActive == False))).scalar() or 0
+
+    # ── Top 5 villages ────────────────────────────────────────────────────────
+    village_rows = (await db.execute(
+        select(Users.City, func.count(Users.ID).label("n"))
+        .where(Users.IsDeleted == False, Users.City.isnot(None), Users.City != "")
+        .group_by(Users.City)
+        .order_by(func.count(Users.ID).desc())
+        .limit(5)
+    )).all()
+
+    # ── Recent 10 registrations ───────────────────────────────────────────────
+    recent_rows = (await db.execute(
+        select(Users.UserName, Users.MobileNo, Users.RoleCode, Users.City, Users.CreatedOn)
+        .where(Users.IsDeleted == False)
+        .order_by(Users.CreatedOn.desc())
+        .limit(10)
+    )).all()
+
+    return {
+        "status": "success",
+        "generatedAt": now.isoformat(),
+        "users": {
+            "total":  total_users,
+            "byRole": by_role,
+            "new7d":  new_7d,
+            "new30d": new_30d,
+            "dailySignups": daily_signups,
+        },
+        "orders": {
+            "total":     sum(order_counts.values()),
+            "pending":   order_counts[STATUS_CREATED],
+            "active":    order_counts[STATUS_ACCEPTED],
+            "cancelled": order_counts[STATUS_CANCELLED],
+            "completed": order_counts[STATUS_COMPLETED],
+        },
+        "equipment": {
+            "active":   equip_active,
+            "inactive": equip_inactive,
+            "total":    equip_active + equip_inactive,
+        },
+        "topVillages": [{"village": v, "count": c} for v, c in village_rows],
+        "recentUsers": [
+            {
+                "name":     name,
+                "mobile":   mobile,
+                "role":     role_label.get(rc, "unknown"),
+                "village":  city or "—",
+                "joinedOn": ts.strftime("%d %b %Y") if ts else "—",
+            }
+            for name, mobile, rc, city, ts in recent_rows
+        ],
+    }
 
 
 # ── Rating ────────────────────────────────────────────────────────────────────
