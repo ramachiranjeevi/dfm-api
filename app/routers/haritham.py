@@ -162,10 +162,11 @@ async def send_otp(body: SendOtpRequest, db: AsyncSession = Depends(get_db)):
     sms_result = await send_sms(body.mobile, f"Your Haritham OTP is {otp}. Valid for 10 minutes.")
     logger.info("SMS result for %s: %s", body.mobile, sms_result)
     sms_ok = sms_result.get("status") == "success"
+    if not sms_ok:
+        logger.warning("SMS failed for %s — OTP saved to DB only (not exposed in response)", body.mobile)
     return {
         "status": "success",
-        "message": "OTP sent" if sms_ok else "SMS unavailable — use OTP below for testing",
-        "otp": None if sms_ok else otp,
+        "message": "OTP sent to your mobile number",
     }
 
 
