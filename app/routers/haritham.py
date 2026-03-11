@@ -909,8 +909,12 @@ async def admin_analytics(db: AsyncSession = Depends(get_db)):
 
     role_label = {ROLE_FARMER: "farmer", ROLE_OWNER: "owner", ROLE_BOTH: "both"}
 
-    # Only count users registered via Haritham (CreatedBy="haritham")
-    HARITHAM_FILTER = (Users.IsDeleted == False, Users.CreatedBy == "haritham")
+    # Only count Haritham users — exclude admins and old DFM accounts
+    HARITHAM_FILTER = (
+        Users.IsDeleted == False,
+        Users.CreatedBy == "haritham",
+        Users.RoleCode != ROLE_ADMIN,   # hard-exclude admin role regardless of CreatedBy
+    )
 
     # ── Users by role ─────────────────────────────────────────────────────────
     role_rows = (await db.execute(
@@ -919,12 +923,13 @@ async def admin_analytics(db: AsyncSession = Depends(get_db)):
         .group_by(Users.RoleCode)
     )).all()
 
-    by_role = {v: 0 for v in role_label.values()}
+    by_role = {"farmer": 0, "owner": 0, "both": 0}
     total_users = 0
     for rc, cnt in role_rows:
-        key = role_label.get(rc, f"role_{rc}")
-        by_role[key] = by_role.get(key, 0) + cnt
-        total_users += cnt
+        key = role_label.get(rc)
+        if key:   # skip any unknown/admin role codes entirely
+            by_role[key] += cnt
+            total_users += cnt
 
     # ── New registrations ─────────────────────────────────────────────────────
     new_7d  = (await db.execute(select(func.count(Users.ID)).where(*HARITHAM_FILTER, Users.CreatedOn >= ago_7d))).scalar() or 0
