@@ -907,12 +907,15 @@ async def admin_analytics(db: AsyncSession = Depends(get_db)):
     ago_7d   = now - timedelta(days=7)
     ago_30d  = now - timedelta(days=30)
 
-    role_label = {ROLE_FARMER: "farmer", ROLE_OWNER: "owner", ROLE_BOTH: "both", ROLE_ADMIN: "admin"}
+    role_label = {ROLE_FARMER: "farmer", ROLE_OWNER: "owner", ROLE_BOTH: "both"}
+
+    # Only count users registered via Haritham (CreatedBy="haritham")
+    HARITHAM_FILTER = (Users.IsDeleted == False, Users.CreatedBy == "haritham")
 
     # ── Users by role ─────────────────────────────────────────────────────────
     role_rows = (await db.execute(
         select(Users.RoleCode, func.count(Users.ID).label("n"))
-        .where(Users.IsDeleted == False)
+        .where(*HARITHAM_FILTER)
         .group_by(Users.RoleCode)
     )).all()
 
@@ -924,13 +927,13 @@ async def admin_analytics(db: AsyncSession = Depends(get_db)):
         total_users += cnt
 
     # ── New registrations ─────────────────────────────────────────────────────
-    new_7d  = (await db.execute(select(func.count(Users.ID)).where(Users.IsDeleted == False, Users.CreatedOn >= ago_7d))).scalar() or 0
-    new_30d = (await db.execute(select(func.count(Users.ID)).where(Users.IsDeleted == False, Users.CreatedOn >= ago_30d))).scalar() or 0
+    new_7d  = (await db.execute(select(func.count(Users.ID)).where(*HARITHAM_FILTER, Users.CreatedOn >= ago_7d))).scalar() or 0
+    new_30d = (await db.execute(select(func.count(Users.ID)).where(*HARITHAM_FILTER, Users.CreatedOn >= ago_30d))).scalar() or 0
 
     # ── Daily signups — last 14 days (raw rows, grouped in Python) ────────────
     daily_rows = (await db.execute(
         select(Users.CreatedOn)
-        .where(Users.IsDeleted == False, Users.CreatedOn >= now - timedelta(days=14))
+        .where(*HARITHAM_FILTER, Users.CreatedOn >= now - timedelta(days=14))
         .order_by(Users.CreatedOn)
     )).scalars().all()
 
@@ -960,7 +963,7 @@ async def admin_analytics(db: AsyncSession = Depends(get_db)):
     # ── Top 5 villages ────────────────────────────────────────────────────────
     village_rows = (await db.execute(
         select(Users.City, func.count(Users.ID).label("n"))
-        .where(Users.IsDeleted == False, Users.City.isnot(None), Users.City != "")
+        .where(*HARITHAM_FILTER, Users.City.isnot(None), Users.City != "")
         .group_by(Users.City)
         .order_by(func.count(Users.ID).desc())
         .limit(5)
@@ -969,7 +972,7 @@ async def admin_analytics(db: AsyncSession = Depends(get_db)):
     # ── Recent 10 registrations ───────────────────────────────────────────────
     recent_rows = (await db.execute(
         select(Users.UserName, Users.MobileNo, Users.RoleCode, Users.City, Users.CreatedOn)
-        .where(Users.IsDeleted == False)
+        .where(*HARITHAM_FILTER)
         .order_by(Users.CreatedOn.desc())
         .limit(10)
     )).all()
