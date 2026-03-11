@@ -65,6 +65,7 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class SendOtpRequest(BaseModel):
     mobile: str
+    flow: str = "login"   # "login" | "register"
 
 class VerifyOtpRequest(BaseModel):
     mobile: str
@@ -145,6 +146,22 @@ async def _notify(mobile: str, title: str, body: str, db: AsyncSession) -> None:
 
 @router.post("/send-otp", summary="Send OTP (works for both new & existing users)")
 async def send_otp(body: SendOtpRequest, db: AsyncSession = Depends(get_db)):
+
+    # For login flow — reject unregistered numbers immediately
+    if body.flow == "login":
+        user_check = await db.execute(
+            select(Users).where(
+                Users.MobileNo == body.mobile,
+                Users.IsDeleted == False,
+                Users.CreatedBy == "haritham",
+            )
+        )
+        if not user_check.scalar_one_or_none():
+            raise HTTPException(
+                status_code=404,
+                detail="This number is not registered. Please register first."
+            )
+
     otp = generate_otp()
 
     # Save to VerifyOTP (always)
