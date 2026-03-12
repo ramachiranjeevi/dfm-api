@@ -126,6 +126,22 @@ class PushSubscribeRequest(BaseModel):
     mobile: str
     subscription: dict   # browser PushSubscription.toJSON()
 
+# ── Produce marketplace schemas ────────────────────────────────────────────────
+class CreateProduceListingRequest(BaseModel):
+    farmerUCode: str
+    cropType: str
+    cropCategory: str | None = None
+    variety: str | None = None
+    quantity: float
+    unit: str = "kg"
+    pricePerUnit: float | None = None
+    priceNegotiable: bool = True
+    qualityNotes: str | None = None
+    lat: float | None = None
+    lng: float | None = None
+    village: str | None = None
+    expiryDays: int = 7
+
 
 # ── Notification helper ────────────────────────────────────────────────────────
 
@@ -1071,6 +1087,192 @@ async def rate_order(order_id: str, body: RateOrderRequest, db: AsyncSession = D
     )
     await db.commit()
     return {"status": "success", "orderId": order_id, "rating": body.rating}
+
+
+# ── Produce Marketplace ───────────────────────────────────────────────────────
+
+_produce_table_ensured = False
+
+async def _ensure_produce_table(db: AsyncSession) -> None:
+    """Idempotent: create haritham_produce_listing table if it doesn't exist."""
+    global _produce_table_ensured
+    if _produce_table_ensured:
+        return
+    try:
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS haritham_produce_listing (
+                "Id"              SERIAL PRIMARY KEY,
+                "FarmerUCode"     VARCHAR(50)  NOT NULL,
+                "CropType"        VARCHAR(100) NOT NULL,
+                "CropCategory"    VARCHAR(50),
+                "Variety"         VARCHAR(100),
+                "Quantity"        NUMERIC(12,2) NOT NULL,
+                "Unit"            VARCHAR(20)  NOT NULL DEFAULT 'kg',
+                "PricePerUnit"    NUMERIC(10,2),
+                "PriceNegotiable" BOOLEAN      DEFAULT TRUE,
+                "QualityNotes"    VARCHAR(500),
+                "Lat"             NUMERIC(10,6),
+                "Lng"             NUMERIC(10,6),
+                "Village"         VARCHAR(200),
+                "ExpiresAt"       TIMESTAMP    NOT NULL,
+                "Status"          VARCHAR(20)  DEFAULT 'active',
+                "CreatedOn"       TIMESTAMP    DEFAULT NOW(),
+                "IsDeleted"       BOOLEAN      DEFAULT FALSE,
+                "CreatedBy"       VARCHAR(50)  DEFAULT 'haritham'
+            )
+        """))
+        await db.commit()
+        _produce_table_ensured = True
+        logger.info("haritham_produce_listing table ensured.")
+    except Exception as exc:
+        logger.warning("Produce table migration skipped: %s", exc)
+        await db.rollback()
+
+
+@router.post("/produce", summary="Farmer posts a produce listing")
+async def create_produce_listing(body: CreateProduceListingRequest, db: AsyncSession = Depends(get_db)):
+    await _ensure_produce_table(db)
+    expires_at = datetime.utcnow() + timedelta(days=max(1, min(body.expiryDays, 30)))
+    result = await db.execute(text("""
+        INSERT INTO haritham_produce_listing
+            ("FarmerUCode","CropType","CropCategory","Variety","Quantity","Unit",
+             "PricePerUnit","PriceNegotiable","QualityNotes","Lat","Lng","Village",
+             "ExpiresAt","Status","CreatedOn","IsDeleted","CreatedBy")
+        VALUES
+            (:ucode,:crop,:cat,:variety,:qty,:unit,
+             :price,:negotiable,:notes,:lat,:lng,:village,
+             :expires,'active',NOW(),FALSE,'haritham')
+        RETURNING "Id"
+    """), {
+        "ucode":      body.farmerUCode,
+        "crop":       body.cropType,
+        "cat":        body.cropCategory,
+        "variety":    body.variety,
+        "qty":        body.quantity,
+        "unit":       body.unit,
+        "price":      body.pricePerUnit,
+        "negotiable": body.priceNegotiable,
+        "notes":      body.qualityNotes,
+        "lat":        body.lat,
+        "lng":        body.lng,
+        "village":    body.village,
+        "expires":    expires_at,
+    })
+    row = result.fetchone()
+    await db.commit()
+    return {"status": "success", "listingId": row[0], "expiresAt": expires_at.isoformat()}
+
+
+@router.get("/produce/nearby", summary="Get nearby active produce listings")
+async def nearby_produce(lat: float, lng: float, radius: float = 100.0,
+                         crop: str | None = None, db: AsyncSession = Depends(get_db)):
+    await _ensure_produce_table(db)
+    now = datetime.utcnow()
+    result = await db.execute(text("""
+        SELECT p."Id", p."FarmerUCode", p."CropType", p."CropCategory", p."Variety",
+               p."Quantity", p."Unit", p."PricePerUnit", p."PriceNegotiable",
+               p."QualityNotes", p."Lat", p."Lng", p."Village",
+               p."ExpiresAt", p."Status", p."CreatedOn",
+               u."UserName", u."MobileNo"
+        FROM haritham_produce_listing p
+        LEFT JOIN "Users" u ON u."UCode" = p."FarmerUCode"
+        WHERE p."IsDeleted" = FALSE
+          AND p."Status" = 'active'
+          AND p."ExpiresAt" > :now
+          AND p."Lat" IS NOT NULL
+          AND p."Lng" IS NOT NULL
+    """), {"now": now})
+    rows = result.fetchall()
+
+    listings = []
+    for r in rows:
+        if r[10] is None or r[11] is None:
+            continue
+        dist = haversine_km(lat, lng, float(r[10]), float(r[11]))
+        if dist > radius:
+            continue
+        if crop and crop.lower() not in (r[2] or "").lower():
+            continue
+        listings.append({
+            "id":            r[0],
+            "farmerUCode":   r[1],
+            "cropType":      r[2],
+            "cropCategory":  r[3],
+            "variety":       r[4],
+            "quantity":      float(r[5]) if r[5] else 0,
+            "unit":          r[6],
+            "pricePerUnit":  float(r[7]) if r[7] else None,
+            "priceNegotiable": bool(r[8]),
+            "qualityNotes":  r[9],
+            "lat":           float(r[10]),
+            "lng":           float(r[11]),
+            "village":       r[12],
+            "expiresAt":     r[13].isoformat() if r[13] else None,
+            "status":        r[14],
+            "postedOn":      r[15].isoformat() if r[15] else None,
+            "farmerName":    r[16] or "Farmer",
+            "farmerMobile":  r[17] or "",
+            "distance":      round(dist, 1),
+        })
+
+    listings.sort(key=lambda x: x["distance"])
+    return {"status": "success", "count": len(listings), "listings": listings}
+
+
+@router.get("/produce/my/{farmer_ucode}", summary="Get farmer's own listings")
+async def my_produce_listings(farmer_ucode: str, db: AsyncSession = Depends(get_db)):
+    await _ensure_produce_table(db)
+    result = await db.execute(text("""
+        SELECT "Id","CropType","CropCategory","Variety","Quantity","Unit",
+               "PricePerUnit","PriceNegotiable","QualityNotes","Village",
+               "ExpiresAt","Status","CreatedOn"
+        FROM haritham_produce_listing
+        WHERE "FarmerUCode" = :ucode AND "IsDeleted" = FALSE
+        ORDER BY "CreatedOn" DESC
+    """), {"ucode": farmer_ucode})
+    rows = result.fetchall()
+    listings = []
+    for r in rows:
+        listings.append({
+            "id":            r[0],
+            "cropType":      r[1],
+            "cropCategory":  r[2],
+            "variety":       r[3],
+            "quantity":      float(r[4]) if r[4] else 0,
+            "unit":          r[5],
+            "pricePerUnit":  float(r[6]) if r[6] else None,
+            "priceNegotiable": bool(r[7]),
+            "qualityNotes":  r[8],
+            "village":       r[9],
+            "expiresAt":     r[10].isoformat() if r[10] else None,
+            "status":        r[11],
+            "postedOn":      r[12].isoformat() if r[12] else None,
+        })
+    return {"status": "success", "listings": listings}
+
+
+@router.patch("/produce/{listing_id}/sold", summary="Mark produce listing as sold")
+async def mark_produce_sold(listing_id: int, db: AsyncSession = Depends(get_db)):
+    await _ensure_produce_table(db)
+    await db.execute(text("""
+        UPDATE haritham_produce_listing
+        SET "Status" = 'sold'
+        WHERE "Id" = :id AND "IsDeleted" = FALSE
+    """), {"id": listing_id})
+    await db.commit()
+    return {"status": "success", "listingId": listing_id}
+
+
+@router.delete("/produce/{listing_id}", summary="Delete farmer's produce listing")
+async def delete_produce_listing(listing_id: int, db: AsyncSession = Depends(get_db)):
+    await _ensure_produce_table(db)
+    await db.execute(text("""
+        UPDATE haritham_produce_listing
+        SET "IsDeleted" = TRUE
+        WHERE "Id" = :id
+    """), {"id": listing_id})
+    await db.commit()
+    return {"status": "success", "listingId": listing_id}
 
 
 # ── Live Tracking (WebSocket) ─────────────────────────────────────────────────
