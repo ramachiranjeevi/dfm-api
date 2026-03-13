@@ -32,6 +32,7 @@ ROLE_FARMER = 2
 ROLE_OWNER  = 3
 ROLE_BOTH   = 4
 ROLE_ADMIN  = 1
+ROLE_TRADER = 5   # Buyer / Trader / Aggregator
 
 # ── Order status codes ────────────────────────────────────────────────────────
 STATUS_CREATED   = 0
@@ -141,6 +142,20 @@ class CreateProduceListingRequest(BaseModel):
     lng: float | None = None
     village: str | None = None
     expiryDays: int = 7
+    photos: list[str] | None = None   # list of base64 data-URIs (max 3)
+
+class ContactProduceRequest(BaseModel):
+    buyerUCode: str | None = None
+    buyerName:  str | None = None
+    method:     str = "call"   # "call" | "whatsapp"
+
+class DealDoneRequest(BaseModel):
+    finalPrice: float | None = None
+
+class UserExtrasRequest(BaseModel):
+    gstNo:            str | None = None
+    mandiLicenseNo:   str | None = None
+    isVerifiedTrader: bool | None = None
 
 
 # ── Notification helper ────────────────────────────────────────────────────────
@@ -1094,7 +1109,7 @@ async def rate_order(order_id: str, body: RateOrderRequest, db: AsyncSession = D
 _produce_table_ensured = False
 
 async def _ensure_produce_table(db: AsyncSession) -> None:
-    """Idempotent: create haritham_produce_listing table if it doesn't exist."""
+    """Idempotent: create / migrate haritham_produce_listing table."""
     global _produce_table_ensured
     if _produce_table_ensured:
         return
@@ -1121,6 +1136,13 @@ async def _ensure_produce_table(db: AsyncSession) -> None:
                 "CreatedBy"       VARCHAR(50)  DEFAULT 'haritham'
             )
         """))
+        # Phase 1 columns — safe to run even if table already existed
+        for col_sql in [
+            'ALTER TABLE haritham_produce_listing ADD COLUMN IF NOT EXISTS "ContactCount" INTEGER DEFAULT 0',
+            'ALTER TABLE haritham_produce_listing ADD COLUMN IF NOT EXISTS "FinalPrice"   NUMERIC(10,2)',
+            'ALTER TABLE haritham_produce_listing ADD COLUMN IF NOT EXISTS "Photos"       TEXT',
+        ]:
+            await db.execute(text(col_sql))
         await db.commit()
         _produce_table_ensured = True
         logger.info("haritham_produce_listing table ensured.")
@@ -1129,19 +1151,45 @@ async def _ensure_produce_table(db: AsyncSession) -> None:
         await db.rollback()
 
 
+_user_extras_ensured = False
+
+async def _ensure_user_extras_table(db: AsyncSession) -> None:
+    """Idempotent: create haritham_user_extras for GST / trader verification."""
+    global _user_extras_ensured
+    if _user_extras_ensured:
+        return
+    try:
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS haritham_user_extras (
+                "UCode"            VARCHAR(50) PRIMARY KEY,
+                "GSTNo"            VARCHAR(50),
+                "MandiLicenseNo"   VARCHAR(50),
+                "IsVerifiedTrader" BOOLEAN DEFAULT FALSE,
+                "UpdatedOn"        TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        await db.commit()
+        _user_extras_ensured = True
+    except Exception as exc:
+        logger.warning("User extras table migration skipped: %s", exc)
+        await db.rollback()
+
+
 @router.post("/produce", summary="Farmer posts a produce listing")
 async def create_produce_listing(body: CreateProduceListingRequest, db: AsyncSession = Depends(get_db)):
     await _ensure_produce_table(db)
     expires_at = datetime.utcnow() + timedelta(days=max(1, min(body.expiryDays, 30)))
+    import json as _json
+    photos_json = _json.dumps(body.photos[:3]) if body.photos else None
     result = await db.execute(text("""
         INSERT INTO haritham_produce_listing
             ("FarmerUCode","CropType","CropCategory","Variety","Quantity","Unit",
              "PricePerUnit","PriceNegotiable","QualityNotes","Lat","Lng","Village",
-             "ExpiresAt","Status","CreatedOn","IsDeleted","CreatedBy")
+             "ExpiresAt","Status","Photos","CreatedOn","IsDeleted","CreatedBy")
         VALUES
             (:ucode,:crop,:cat,:variety,:qty,:unit,
              :price,:negotiable,:notes,:lat,:lng,:village,
-             :expires,'active',NOW(),FALSE,'haritham')
+             :expires,'active',:photos,NOW(),FALSE,'haritham')
         RETURNING "Id"
     """), {
         "ucode":      body.farmerUCode,
@@ -1157,6 +1205,7 @@ async def create_produce_listing(body: CreateProduceListingRequest, db: AsyncSes
         "lng":        body.lng,
         "village":    body.village,
         "expires":    expires_at,
+        "photos":     photos_json,
     })
     row = result.fetchone()
     await db.commit()
@@ -1273,6 +1322,90 @@ async def delete_produce_listing(listing_id: int, db: AsyncSession = Depends(get
     """), {"id": listing_id})
     await db.commit()
     return {"status": "success", "listingId": listing_id}
+
+
+@router.post("/produce/{listing_id}/contact", summary="Track buyer contact + notify farmer")
+async def contact_produce_farmer(listing_id: int, body: ContactProduceRequest, db: AsyncSession = Depends(get_db)):
+    """Called when a buyer taps Call or WhatsApp on a listing."""
+    await _ensure_produce_table(db)
+    # Increment contact count
+    await db.execute(text("""
+        UPDATE haritham_produce_listing
+        SET "ContactCount" = COALESCE("ContactCount", 0) + 1
+        WHERE "Id" = :id AND "IsDeleted" = FALSE
+    """), {"id": listing_id})
+    await db.commit()
+
+    # Notify the farmer via push
+    try:
+        row = (await db.execute(text("""
+            SELECT p."FarmerUCode", u."MobileNo", p."CropType"
+            FROM haritham_produce_listing p
+            LEFT JOIN "Users" u ON u."UCode" = p."FarmerUCode"
+            WHERE p."Id" = :id
+        """), {"id": listing_id})).fetchone()
+        if row:
+            buyer_label = body.buyerName or "A buyer"
+            method_str  = "WhatsApp" if body.method == "whatsapp" else "called"
+            await _notify(
+                mobile=row[1],
+                title="New inquiry on your listing! 🛒",
+                body=f"{buyer_label} {method_str} about your {row[2]}. Reply quickly to close the deal!",
+                db=db,
+            )
+    except Exception as exc:
+        logger.warning("Contact notify failed: %s", exc)
+
+    return {"status": "success", "listingId": listing_id}
+
+
+@router.patch("/produce/{listing_id}/deal", summary="Mark deal done with final agreed price")
+async def mark_produce_deal_done(listing_id: int, body: DealDoneRequest, db: AsyncSession = Depends(get_db)):
+    await _ensure_produce_table(db)
+    await db.execute(text("""
+        UPDATE haritham_produce_listing
+        SET "Status" = 'sold',
+            "FinalPrice" = :final_price
+        WHERE "Id" = :id AND "IsDeleted" = FALSE
+    """), {"id": listing_id, "final_price": body.finalPrice})
+    await db.commit()
+    return {"status": "success", "listingId": listing_id, "finalPrice": body.finalPrice}
+
+
+# ── User Extras (GST / Trader Verification) ───────────────────────────────────
+
+@router.get("/users/{user_id}/extras", summary="Get user extras (GST, trader status)")
+async def get_user_extras(user_id: str, db: AsyncSession = Depends(get_db)):
+    await _ensure_user_extras_table(db)
+    row = (await db.execute(text("""
+        SELECT "GSTNo","MandiLicenseNo","IsVerifiedTrader"
+        FROM haritham_user_extras
+        WHERE "UCode" = :ucode
+    """), {"ucode": user_id})).fetchone()
+    if not row:
+        return {"gstNo": None, "mandiLicenseNo": None, "isVerifiedTrader": False}
+    return {"gstNo": row[0], "mandiLicenseNo": row[1], "isVerifiedTrader": bool(row[2])}
+
+
+@router.patch("/users/{user_id}/extras", summary="Update user extras (GST, trader verification)")
+async def update_user_extras(user_id: str, body: UserExtrasRequest, db: AsyncSession = Depends(get_db)):
+    await _ensure_user_extras_table(db)
+    await db.execute(text("""
+        INSERT INTO haritham_user_extras ("UCode","GSTNo","MandiLicenseNo","IsVerifiedTrader","UpdatedOn")
+        VALUES (:ucode, :gst, :mandi, :verified, NOW())
+        ON CONFLICT ("UCode") DO UPDATE
+        SET "GSTNo"            = COALESCE(:gst,    haritham_user_extras."GSTNo"),
+            "MandiLicenseNo"   = COALESCE(:mandi,  haritham_user_extras."MandiLicenseNo"),
+            "IsVerifiedTrader" = COALESCE(:verified, haritham_user_extras."IsVerifiedTrader"),
+            "UpdatedOn"        = NOW()
+    """), {
+        "ucode":    user_id,
+        "gst":      body.gstNo,
+        "mandi":    body.mandiLicenseNo,
+        "verified": body.isVerifiedTrader,
+    })
+    await db.commit()
+    return {"status": "success"}
 
 
 # ── Live Tracking (WebSocket) ─────────────────────────────────────────────────
