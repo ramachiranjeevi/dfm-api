@@ -33,6 +33,7 @@ ROLE_OWNER  = 3
 ROLE_BOTH   = 4
 ROLE_ADMIN  = 1
 ROLE_TRADER = 5   # Buyer / Trader / Aggregator
+ROLE_DEALER = 6   # Agri-input dealer (seeds / pesticides / tools shop)
 
 # ── Order status codes ────────────────────────────────────────────────────────
 STATUS_CREATED   = 0
@@ -156,6 +157,23 @@ class UserExtrasRequest(BaseModel):
     gstNo:            str | None = None
     mandiLicenseNo:   str | None = None
     isVerifiedTrader: bool | None = None
+
+# ── Agri-Input Shop schemas ────────────────────────────────────────────────────
+class AddShopRequest(BaseModel):
+    name:          str
+    shopType:      str              # pesticide|fertilizer|seeds|tools|equipment|general
+    lat:           float
+    lng:           float
+    phone:         str | None = None
+    village:       str | None = None
+    addedByUCode:  str | None = None
+
+class ConfirmShopRequest(BaseModel):
+    confirmedByUCode: str | None = None
+
+class ClaimShopRequest(BaseModel):
+    claimedByUCode: str
+    phone:          str | None = None   # dealer may update phone on claim
 
 
 # ── Notification helper ────────────────────────────────────────────────────────
@@ -1068,6 +1086,183 @@ async def admin_analytics(db: AsyncSession = Depends(get_db)):
     }
 
 
+# ── Admin: User List ──────────────────────────────────────────────────────────
+
+@router.get("/admin/users", summary="Admin — paginated user list with search & role filter")
+async def admin_users(
+    search: str | None = None,
+    role:   str | None = None,
+    page:   int = 1,
+    limit:  int = 30,
+    db: AsyncSession = Depends(get_db),
+):
+    role_map   = {"farmer": ROLE_FARMER, "owner": ROLE_OWNER, "both": ROLE_BOTH}
+    role_label = {ROLE_FARMER: "farmer", ROLE_OWNER: "owner", ROLE_BOTH: "both"}
+
+    HARITHAM_FILTER = [
+        Users.IsDeleted == False,
+        Users.CreatedBy == "haritham",
+        Users.RoleCode  != ROLE_ADMIN,
+    ]
+    if role and role in role_map:
+        HARITHAM_FILTER.append(Users.RoleCode == role_map[role])
+    if search:
+        like = f"%{search}%"
+        from sqlalchemy import or_
+        HARITHAM_FILTER.append(
+            or_(Users.UserName.ilike(like), Users.MobileNo.ilike(like), Users.City.ilike(like))
+        )
+
+    offset = (page - 1) * limit
+    total = (await db.execute(
+        select(func.count(Users.ID)).where(*HARITHAM_FILTER)
+    )).scalar() or 0
+
+    rows = (await db.execute(
+        select(Users.ID, Users.UserName, Users.MobileNo, Users.RoleCode,
+               Users.City, Users.CreatedOn, Users.IsActive,
+               Users.Lat, Users.Long)
+        .where(*HARITHAM_FILTER)
+        .order_by(Users.CreatedOn.desc())
+        .offset(offset).limit(limit)
+    )).all()
+
+    users = [
+        {
+            "id":       uid,
+            "name":     name or "—",
+            "mobile":   mobile or "—",
+            "role":     role_label.get(rc, "unknown"),
+            "village":  city or "—",
+            "joinedOn": ts.strftime("%d %b %Y") if ts else "—",
+            "active":   bool(active),
+            "hasLocation": lat is not None and lng is not None,
+        }
+        for uid, name, mobile, rc, city, ts, active, lat, lng in rows
+    ]
+
+    return {"status": "success", "total": total, "page": page, "limit": limit, "users": users}
+
+
+@router.patch("/admin/users/{user_id}/block", summary="Admin — toggle block/unblock a user")
+async def admin_block_user(user_id: int, db: AsyncSession = Depends(get_db)):
+    row = (await db.execute(select(Users.IsActive).where(Users.ID == user_id))).scalar()
+    if row is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    new_active = not bool(row)
+    await db.execute(update(Users).where(Users.ID == user_id).values(IsActive=new_active))
+    await db.commit()
+    return {"status": "success", "userId": user_id, "active": new_active}
+
+
+# ── Feedback ──────────────────────────────────────────────────────────────────
+
+_feedback_table_ensured = False
+
+async def _ensure_feedback_table(db: AsyncSession) -> None:
+    global _feedback_table_ensured
+    if _feedback_table_ensured:
+        return
+    try:
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS haritham_feedback (
+                "Id"         SERIAL PRIMARY KEY,
+                "UserUCode"  VARCHAR(50),
+                "UserName"   VARCHAR(200),
+                "Mobile"     VARCHAR(20),
+                "Role"       VARCHAR(20),
+                "Stars"      INTEGER NOT NULL DEFAULT 0,
+                "Category"   VARCHAR(50),
+                "Message"    TEXT,
+                "CreatedOn"  TIMESTAMP DEFAULT NOW(),
+                "IsRead"     BOOLEAN DEFAULT FALSE
+            )
+        """))
+        await db.commit()
+        _feedback_table_ensured = True
+        logger.info("haritham_feedback table ensured.")
+    except Exception as exc:
+        logger.warning("Feedback table migration skipped: %s", exc)
+        await db.rollback()
+
+
+class FeedbackRequest(BaseModel):
+    ucode:    str
+    name:     str
+    mobile:   str
+    role:     str
+    stars:    int            # 1–5
+    category: str = "general"   # general | bug | feature
+    message:  str = ""
+
+
+@router.post("/feedback", summary="Submit app feedback from any user")
+async def submit_feedback(body: FeedbackRequest, db: AsyncSession = Depends(get_db)):
+    await _ensure_feedback_table(db)
+    if body.stars < 1 or body.stars > 5:
+        raise HTTPException(status_code=400, detail="Stars must be 1–5")
+    await db.execute(text("""
+        INSERT INTO haritham_feedback
+            ("UserUCode","UserName","Mobile","Role","Stars","Category","Message","CreatedOn","IsRead")
+        VALUES
+            (:ucode,:name,:mobile,:role,:stars,:category,:message,NOW(),FALSE)
+    """), {
+        "ucode": body.ucode, "name": body.name, "mobile": body.mobile,
+        "role": body.role, "stars": body.stars, "category": body.category,
+        "message": body.message,
+    })
+    await db.commit()
+    return {"status": "success"}
+
+
+@router.get("/admin/feedback", summary="Admin — list all user feedback")
+async def admin_feedback(
+    unread_only: bool = False,
+    page:  int = 1,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    await _ensure_feedback_table(db)
+    where = '"IsRead" = FALSE' if unread_only else "TRUE"
+    offset = (page - 1) * limit
+
+    total = (await db.execute(text(
+        f'SELECT COUNT(*) FROM haritham_feedback WHERE {where}'
+    ))).scalar() or 0
+
+    rows = (await db.execute(text(
+        f"""SELECT "Id","UserName","Mobile","Role","Stars","Category","Message","CreatedOn","IsRead"
+            FROM haritham_feedback WHERE {where}
+            ORDER BY "CreatedOn" DESC LIMIT :limit OFFSET :offset"""
+    ), {"limit": limit, "offset": offset})).all()
+
+    items = [
+        {
+            "id":       r[0],
+            "name":     r[1] or "—",
+            "mobile":   r[2] or "—",
+            "role":     r[3] or "—",
+            "stars":    r[4],
+            "category": r[5] or "general",
+            "message":  r[6] or "",
+            "date":     r[7].strftime("%d %b %Y, %I:%M %p") if r[7] else "—",
+            "isRead":   bool(r[8]),
+        }
+        for r in rows
+    ]
+    return {"status": "success", "total": total, "items": items}
+
+
+@router.patch("/admin/feedback/{feedback_id}/read", summary="Mark feedback as read")
+async def mark_feedback_read(feedback_id: int, db: AsyncSession = Depends(get_db)):
+    await _ensure_feedback_table(db)
+    await db.execute(text(
+        'UPDATE haritham_feedback SET "IsRead" = TRUE WHERE "Id" = :id'
+    ), {"id": feedback_id})
+    await db.commit()
+    return {"status": "success"}
+
+
 # ── Rating ────────────────────────────────────────────────────────────────────
 
 _rating_col_migrated = False
@@ -1300,6 +1495,35 @@ async def my_produce_listings(farmer_ucode: str, db: AsyncSession = Depends(get_
     return {"status": "success", "listings": listings}
 
 
+@router.get("/produce/heatmap", summary="Demand heatmap — active listings weighted by buyer contacts")
+async def produce_heatmap(lat: float, lng: float, radius: float = 150.0,
+                          db: AsyncSession = Depends(get_db)):
+    """Active listings with contact counts as intensity for frontend heatmap rendering."""
+    await _ensure_produce_table(db)
+    now = datetime.utcnow()
+    result = await db.execute(text("""
+        SELECT "Lat", "Lng", COALESCE("ContactCount", 0), "CropCategory"
+        FROM haritham_produce_listing
+        WHERE "IsDeleted" = FALSE
+          AND "Status" = 'active'
+          AND "ExpiresAt" > :now
+          AND "Lat" IS NOT NULL
+          AND "Lng" IS NOT NULL
+    """), {"now": now})
+    points = []
+    for r in result.fetchall():
+        dist = haversine_km(lat, lng, float(r[0]), float(r[1]))
+        if dist > radius:
+            continue
+        points.append({
+            "lat":       float(r[0]),
+            "lng":       float(r[1]),
+            "intensity": max(1, int(r[2])),
+            "category":  r[3],
+        })
+    return {"status": "success", "points": points}
+
+
 @router.patch("/produce/{listing_id}/sold", summary="Mark produce listing as sold")
 async def mark_produce_sold(listing_id: int, db: AsyncSession = Depends(get_db)):
     await _ensure_produce_table(db)
@@ -1406,6 +1630,129 @@ async def update_user_extras(user_id: str, body: UserExtrasRequest, db: AsyncSes
     })
     await db.commit()
     return {"status": "success"}
+
+
+# ── Agri-Input Shops ──────────────────────────────────────────────────────────
+
+_shops_table_ensured = False
+
+async def _ensure_shops_table(db: AsyncSession) -> None:
+    """Idempotent: create haritham_agri_shops for community-sourced dealer map."""
+    global _shops_table_ensured
+    if _shops_table_ensured:
+        return
+    try:
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS haritham_agri_shops (
+                "Id"             SERIAL PRIMARY KEY,
+                "Name"           VARCHAR(200) NOT NULL,
+                "ShopType"       VARCHAR(50)  NOT NULL,
+                "Lat"            NUMERIC(10,6) NOT NULL,
+                "Lng"            NUMERIC(10,6) NOT NULL,
+                "Phone"          VARCHAR(20),
+                "Village"        VARCHAR(100),
+                "AddedByUCode"   VARCHAR(50),
+                "ClaimedByUCode" VARCHAR(50),
+                "IsVerified"     BOOLEAN DEFAULT FALSE,
+                "ConfirmCount"   INTEGER DEFAULT 0,
+                "CreatedOn"      TIMESTAMP DEFAULT NOW(),
+                "IsDeleted"      BOOLEAN DEFAULT FALSE
+            )
+        """))
+        await db.commit()
+        _shops_table_ensured = True
+        logger.info("haritham_agri_shops table ensured.")
+    except Exception as exc:
+        logger.warning("Shops table migration skipped: %s", exc)
+        await db.rollback()
+
+
+@router.post("/shops", summary="Add a community agri-input shop pin")
+async def add_agri_shop(body: AddShopRequest, db: AsyncSession = Depends(get_db)):
+    await _ensure_shops_table(db)
+    result = await db.execute(text("""
+        INSERT INTO haritham_agri_shops
+            ("Name","ShopType","Lat","Lng","Phone","Village","AddedByUCode","CreatedOn","IsDeleted","ConfirmCount")
+        VALUES (:name,:type,:lat,:lng,:phone,:village,:added,NOW(),FALSE,0)
+        RETURNING "Id"
+    """), {
+        "name":    body.name,
+        "type":    body.shopType,
+        "lat":     body.lat,
+        "lng":     body.lng,
+        "phone":   body.phone,
+        "village": body.village,
+        "added":   body.addedByUCode,
+    })
+    row = result.fetchone()
+    await db.commit()
+    return {"status": "success", "shopId": row[0]}
+
+
+@router.get("/shops/nearby", summary="Get nearby agri-input shops within radius")
+async def nearby_shops(lat: float, lng: float, radius: float = 30.0,
+                       shop_type: str | None = None, db: AsyncSession = Depends(get_db)):
+    await _ensure_shops_table(db)
+    result = await db.execute(text("""
+        SELECT "Id","Name","ShopType","Lat","Lng","Phone","Village",
+               "IsVerified","ConfirmCount"
+        FROM haritham_agri_shops
+        WHERE "IsDeleted" = FALSE
+    """))
+    shops = []
+    for r in result.fetchall():
+        if r[3] is None or r[4] is None:
+            continue
+        dist = haversine_km(lat, lng, float(r[3]), float(r[4]))
+        if dist > radius:
+            continue
+        if shop_type and shop_type != r[2]:
+            continue
+        shops.append({
+            "id":           r[0],
+            "name":         r[1],
+            "shopType":     r[2],
+            "lat":          float(r[3]),
+            "lng":          float(r[4]),
+            "phone":        r[5],
+            "village":      r[6],
+            "isVerified":   bool(r[7]),
+            "confirmCount": r[8] or 0,
+            "distance":     round(dist, 1),
+        })
+    shops.sort(key=lambda x: x["distance"])
+    return {"status": "success", "count": len(shops), "shops": shops}
+
+
+@router.post("/shops/{shop_id}/confirm", summary="Community confirms a shop exists (+1 vote)")
+async def confirm_agri_shop(shop_id: int, body: ConfirmShopRequest, db: AsyncSession = Depends(get_db)):
+    await _ensure_shops_table(db)
+    await db.execute(text("""
+        UPDATE haritham_agri_shops
+        SET "ConfirmCount" = COALESCE("ConfirmCount", 0) + 1
+        WHERE "Id" = :id AND "IsDeleted" = FALSE
+    """), {"id": shop_id})
+    await db.commit()
+    return {"status": "success", "shopId": shop_id}
+
+
+@router.patch("/shops/{shop_id}/claim", summary="Dealer claims ownership of a shop listing")
+async def claim_agri_shop(shop_id: int, body: ClaimShopRequest, db: AsyncSession = Depends(get_db)):
+    await _ensure_shops_table(db)
+    params: dict[str, Any] = {"id": shop_id, "claimed": body.claimedByUCode}
+    phone_frag = ""
+    if body.phone:
+        phone_frag = ', "Phone" = :phone'
+        params["phone"] = body.phone
+    await db.execute(text(f"""
+        UPDATE haritham_agri_shops
+        SET "ClaimedByUCode" = :claimed,
+            "IsVerified"     = TRUE
+            {phone_frag}
+        WHERE "Id" = :id AND "IsDeleted" = FALSE
+    """), params)
+    await db.commit()
+    return {"status": "success", "shopId": shop_id}
 
 
 # ── Live Tracking (WebSocket) ─────────────────────────────────────────────────
